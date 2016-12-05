@@ -224,3 +224,201 @@ class User
   end
 end
 ```
+
+### Narrow & Isolate
+
+First step is to isolate this code and make it testable. For this we need to find a low-risk way to refactor all dependencies that this code has:
+
+- `Database.where`,
+- `StatusUpdate.find`,
+- `User.find`, and
+- `Analytics.tag`.
+
+We can promote these things to the following roles:
+
+- `Database.where` => `@table_reader.where`,
+- `StatusUpdate.find` => `@status_update_finder.where`,
+- `User.find` => `@user_finder.find`, and
+- `Analytics.tag` => `@event_tagger.tag`.
+
+We should be able to have these default to their original values and also allow to substitute different implementation from the test. Also, it is helpful to pull out this method into the clean environment, where accessing a dependency, without us substituting it - is not possible, for example in a separate code-base, so that we can write a test "it works" and see what fails. First failure is of course all our referenced classes are missing. Let's define all of them without any implementation and make them fail in runtime if we ever call them from our testing environment:
+
+```ruby
+class Database
+  def self.where(table_name)
+    fail "Database:nope"
+  end
+end
+
+class Analytics
+  def self.tag(event)
+    fail "Analytics:nope"
+  end
+end
+
+class StatusUpdate
+  def self.find(id)
+    fail "StatusUpdate:nope"
+  end
+end
+
+class User
+  # .. def notifications ..
+
+  def self.find(id)
+    fail "User:nope"
+  end
+end
+```
+
+In our tests we need to implement our substitutes. For now, they all should be just simple double/stubs:
+
+```ruby
+class FakeTableReader
+  def where(table_name, &filter)
+    [[nil, ["favorited_notification"]]]
+  end
+end
+
+class FakeEventTagger
+  def tag(event)
+
+  end
+end
+
+class FakeUserFinder
+  def find(id)
+    User.new
+  end
+end
+
+class FakeStatusUpdateFinder
+  def find(id)
+    StatusUpdate.new
+  end
+end
+```
+
+Then, we should write the simplest test, that sets up the stage and substitutes all the collaborators and runs the function under the test (no assertion, we are just verifying that we indeed substituted everything right):
+
+```ruby
+it "works" do
+  fake_table_reader = FakeTableReader.new
+  fake_event_tagger = FakeEventTagger.new
+  fake_user_finder = FakeUserFinder.new
+  fake_status_update_finder = FakeStatusUpdateFinder.new
+
+  user = User.new
+             .with_table_reader(fake_table_reader)
+             .with_event_tagger(fake_event_tagger)
+             .with_user_finder(fake_user_finder)
+             .with_status_update_finder(fake_status_update_finder)
+
+  user.notifications
+end
+```
+
+Since we haven't defined all the `with_*` methods yet, let's define them now and also define getters for respective instance variables (properties):
+
+```ruby
+class User
+  # ...
+
+  def table_reader
+    @table_reader ||= Database
+  end
+
+  def event_tagger
+    @event_tagger ||= Analytics
+  end
+
+  def user_finder
+    @user_finder || User
+  end
+
+  def status_update_finder
+    @status_update_finder || StatusUpdate
+  end
+
+  def with_table_reader(table_reader)
+    @table_reader = table_reader
+    self
+  end
+
+  def with_event_tagger(event_tagger)
+    @event_tagger = event_tagger
+    self
+  end
+
+  def with_user_finder(user_finder)
+    @user_finder = user_finder
+    self
+  end
+
+  def with_status_update_finder(status_update_finder)
+    @status_update_finder = status_update_finder
+    self
+  end
+end
+```
+
+If we run our test, it should fail with `RuntimeError: Database:nope` in here:
+
+```ruby
+def notifications
+  notifications = Database            # <<<<<<
+    .where("notifications") do |x|
+```
+
+To fix that, we will need to replace `Database` with `table_reader` getter. This will fix current error and we will get the next one: `RuntimeError User:nope`. Following all these errors and replacing direct dependencies with getters we will finally get a Green Bar (passing test). And our function under the test will look like that:
+
+```ruby
+class User
+  def notifications
+    notifications = table_reader
+      .where("notifications") do |x|
+        (x[1][0] == "followed_notification" && x[1][2] == id.to_s) ||
+            (x[1][0] == "favorited_notification" && status_update_finder.find(x[1][2].to_i).owner_id == id) ||
+            (x[1][0] == "replied_notification" && status_update_finder.find(x[1][2].to_i).owner_id == id) ||
+            (x[1][0] == "reposted_notification" && status_update_finder.find(x[1][2].to_i).owner_id == id)
+      end.map do |row|
+        id, values = row
+        kind = values[0]
+
+        if kind == "followed_notification"
+          {
+              kind: kind,
+              follower: user_finder.find(values[1].to_i),
+              user: user_finder.find(values[2].to_i),
+          }
+        elsif kind == "favorited_notification"
+          {
+              kind: kind,
+              favoriter: user_finder.find(values[1].to_i),
+              status_update: status_update_finder.find(values[2].to_i),
+          }
+        elsif kind == "replied_notification"
+          {
+              kind: kind,
+              sender: user_finder.find(values[1].to_i),
+              status_update: status_update_finder.find(values[2].to_i),
+              reply: status_update_finder.find(values[3].to_i),
+          }
+        elsif kind == "reposted_notification"
+          {
+              kind: kind,
+              reposter: user_finder.find(values[1].to_i),
+              status_update: status_update_finder.find(values[2].to_i),
+          }
+        end
+      end
+
+    event_tagger.tag({name: "fetch_notifications", count: notifications.count})
+    notifications
+  end
+
+  # ...
+end
+```
+
+Structure and logic of the function didn't change at all, but now all the dependencies are injectable and can be used to nicely test it. This concludes the first step - narrow & isolate.
