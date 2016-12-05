@@ -57,6 +57,11 @@ class User
     fail "User:nope"
   end
 
+  attr_reader :id
+  def initialize(id)
+    @id = id
+  end
+
   def notifications
     notifications = table_reader
       .where("notifications") do |x|
@@ -105,7 +110,16 @@ require_relative "./spec_helper"
 
 class FakeTableReader
   def where(table_name, &filter)
-    [[nil, ["favorited_notification"]]]
+    tables(table_name).select(&filter)
+  end
+
+  def insert(table_name, row)
+    tables(table_name) << row
+  end
+
+  def tables(table_name)
+    @tables ||= {}
+    @tables[table_name] ||= []
   end
 end
 
@@ -117,7 +131,7 @@ end
 
 class FakeUserFinder
   def find(id)
-    User.new
+    User.new(id)
   end
 end
 
@@ -128,18 +142,56 @@ class FakeStatusUpdateFinder
 end
 
 RSpec.describe User do
-  it "works" do
-    fake_table_reader = FakeTableReader.new
-    fake_event_tagger = FakeEventTagger.new
-    fake_user_finder = FakeUserFinder.new
-    fake_status_update_finder = FakeStatusUpdateFinder.new
+  let(:fake_table_reader) { FakeTableReader.new }
+  let(:fake_event_tagger) { FakeEventTagger.new }
+  let(:fake_user_finder) { FakeUserFinder.new }
+  let(:fake_status_update_finder) { FakeStatusUpdateFinder.new }
 
-    user = User.new
-               .with_table_reader(fake_table_reader)
-               .with_event_tagger(fake_event_tagger)
-               .with_user_finder(fake_user_finder)
-               .with_status_update_finder(fake_status_update_finder)
+  it "obtains followed notifications for the user" do
+    user = create_user_with_fakes
 
-    user.notifications
+    fake_table_reader
+        .insert("notifications",
+                [1001, ["followed_notification", 2001, "567"]])
+
+    expect(user.notifications.count).to eq(1)
+  end
+
+  it "ignores notifications of invalid kind" do
+    user = create_user_with_fakes
+
+    fake_table_reader
+        .insert("notifications",
+                [1001, ["invalid", 2001, "567"]])
+
+    expect(user.notifications.count).to eq(0)
+  end
+
+  it "ignores notifications of different user" do
+    user = create_user_with_fakes
+
+    fake_table_reader
+        .insert("notifications",
+                [1001, ["followed_notification", 2001, "other user"]])
+
+    expect(user.notifications.count).to eq(0)
+  end
+
+  it "constructs correct followed notification" do
+    user = create_user_with_fakes
+
+    fake_table_reader
+        .insert("notifications",
+                [1001, ["followed_notification", 2001, "567"]])
+
+    expect(user.notifications[0][:kind]).to eq("followed_notification")
+  end
+
+  def create_user_with_fakes
+    User.new(567)
+        .with_table_reader(fake_table_reader)
+        .with_event_tagger(fake_event_tagger)
+        .with_user_finder(fake_user_finder)
+        .with_status_update_finder(fake_status_update_finder)
   end
 end

@@ -421,4 +421,217 @@ class User
 end
 ```
 
-Structure and logic of the function didn't change at all, but now all the dependencies are injectable and can be used to nicely test it. This concludes the first step - narrow & isolate.
+Structure and logic of the function didn't change at all, but now all the dependencies are injectable and can be used to nicely test it. This concludes the first step - narrow & isolate. Now it is time to select a group of knowledge bits that we would like to cover with tests. Since we want to change how `followed_notification`s behave we might as well start testing there.
+
+### Trying to Understand & Writing 1st Test
+
+The group of knowledge bits that are related to `followed_notification` looks like this:
+
+```ruby
+    notifications = table_reader
+      .where("notifications") do |x|
+        (x[1][0] == "followed_notification" && x[1][2] == id.to_s) ||
+        # ...
+      end.map do |row|
+        id, values = row
+        kind = values[0]
+
+        if kind == "followed_notification"
+          {
+              kind: kind,
+              follower: user_finder.find(values[1].to_i),
+              user: user_finder.find(values[2].to_i),
+          }
+        elsif #...
+          # ...
+        end
+      end
+
+    # ...
+    notifications
+```
+
+Now we want to write a test. At the first thought, something like:
+
+```ruby
+it "obtains followed notifications for the user" do
+  # first create a user with all fakes (extracted to a helper method)
+  user = create_user_with_fakes
+
+  # then instruct our table reader fake to return prepared data
+  fake_table_reader
+      .insert("notifications",
+              [1001, ["followed_notification", 2001, 3001]])
+
+  # and expect that we have exactly one notification
+  expect(user.notifications.count).to eq(1)
+end
+
+def create_user_with_fakes
+  User.new(567)
+      .with_table_reader(fake_table_reader)
+      .with_event_tagger(fake_event_tagger)
+      .with_user_finder(fake_user_finder)
+      .with_status_update_finder(fake_status_update_finder)
+end
+
+class FakeTableReader
+  def insert(table_name, row)
+    tables(table_name) << row
+  end
+
+  def tables(table_name)
+    @tables ||= {}
+    @tables[table_name] ||= []
+  end
+
+  def where(table_name, &filter)
+    tables(table_name).select(&filter)
+  end
+end
+```
+
+### Making It Pass
+
+This test fails right away - we don't have any notifications. This is strange. Let's take a closer look on the filtering that we are doing:
+
+```ruby
+(x[1][0] == "followed_notification" && x[1][2] == id.to_s) ||
+```
+
+I believe, we have satisfied the first part of this condition, but not the second one. User id is not the same as 3rd element of this row. Let's make them same:
+
+```ruby
+fake_table_reader
+    .insert("notifications",
+            [1001, ["followed_notification", 2001, 567]])
+                                               # ^ here ^
+```
+
+And this fails again! This code just keeps proving our assumptions wrong. I think we need to take a careful look at that `it.to_s`. `.to_s` - is a conversion to string, so the foreign key actually is stored as a string (who could have thought?). Let's try to make it work:
+
+```ruby
+fake_table_reader
+    .insert("notifications",
+            [1001, ["followed_notification", 2001, "567"]])
+                                                # ^ here ^
+```
+
+### Applying Mutational Testing
+
+And if we run our tests, they pass! Great, now we know that this function is capable of obtaining some followed notifications. Of course our coverage right now is super low. Let's apply mutational testing to it. We should start from the condition:
+
+```ruby
+(x[1][0] == "followed_notification" && x[1][2] == id.to_s) ||
+```
+
+First, let's replace the whole thing with `false`:
+
+```ruby
+false ||
+```
+
+And the test fails - mutant does not survive - our tests are covering for this mutation. Let's try another one: replace the whole thing with `true`:
+
+```ruby
+true ||
+```
+
+Our tests pass - mutant survives - this is a failing test for our tests. In this case it is reasonable to write a new test for a case, when the whole filtering expression should yield `false` - when we have notifications of invalid kind:
+
+```ruby
+it "ignores notifications of invalid kind" do
+  user = create_user_with_fakes
+
+  fake_table_reader
+      .insert("notifications",
+              [1001, ["invalid", 2001, "567"]])
+
+  expect(user.notifications.count).to eq(0)
+end
+```
+
+As a result we shouldn't get any notifications. After running we see that our test fail. Great! This mutant no longer survives. Let's see if our tests will pass when we undo the mutation:
+
+```ruby
+(x[1][0] == "followed_notification" && x[1][2] == id.to_s) ||
+```
+
+And they all pass! Next mutation is inverting the whole condition:
+
+```ruby
+! (x[1][0] == "followed_notification" && x[1][2] == id.to_s) ||
+```
+
+And all our tests are RED. Which means that this mutant does not survive and the test for our test is green. Now, we should dig deeper in the parts of the condition itself:
+
+- `x[1][0] == "followed_notification"`: replacing with `true`, `false`, and inverting; also, changing numeric and string constants; These all changes didn't produce any surviving mutants, so no new tests need to be introduced.
+- `x[1][2] == id.to_s`: replacing with `true`, `false` and inverting; also, changing numeric constants.
+
+Replacing `x[1][2] == id.to_s` with `true`, apparently, leaves all our tests passing - a mutant that survives - a failing test for our test suite. It is time to add this test - when we have notifications of some different user:
+
+```ruby
+it "ignores notifications of different user" do
+  user = create_user_with_fakes
+
+  fake_table_reader
+      .insert("notifications",
+              [1001, ["followed_notification", 2001, "other user"]])
+                                                   # ^   here   ^
+
+  expect(user.notifications.count).to eq(0)
+end
+```
+
+As you can see, having a record with different user id (in this case, even nonsensical user id) makes our test fail. Which means that this mutant no longer survives. Let's see if undoing the mutation will turn our tests GREEN:
+
+```ruby
+(... && x[1][2] == id.to_s) ||
+```
+
+And all our tests pass again. I think we are done with the condition in the filter. I would not touch the conditions that are related to different kinds of notifications, as we want to introduce changes only to "Followed" notifications. So we can dig further into the logic of our group of knowledge bits:
+
+```ruby
+id, values = row
+kind = values[0]
+
+if kind == "followed_notification"
+  {
+      kind: kind,
+      follower: user_finder.find(values[1].to_i),
+      user: user_finder.find(values[2].to_i),
+  }
+elsif #...
+  # ...
+end
+```
+
+So, we can see that we split the row into its `id` and all the other values of the notification record. And apparently, first value is responsible for kind, where we are switching on it to construct correct object (in this case just a lump of data - has map). So let's try to mutate the numeric constant in `kind = values[0]`:
+
+```ruby
+kind = values[1]
+          #  ^^^
+```
+
+And all our tests still pass. This is a failing test for our test suite. We ought to write a new test now. Where we should verify that it constructs correct lumps of data:
+
+```ruby
+it "constructs correct followed notification" do
+  user = create_user_with_fakes
+
+  fake_table_reader
+      .insert("notifications",
+              [1001, ["followed_notification", 2001, "567"]])
+
+  expect(user.notifications[0][:kind]).to eq("followed_notification")
+end
+```
+
+And this test fails, because our `user.notifications[0]` is `nil`, because none of `if` or `elsif` matched the `kind` variable and in Ruby, by default any function returns a `nil` value. This failing test means that we no longer have surviving mutant and let's see if undoing that mutation will make our tests pass:
+
+```ruby
+kind = values[0]
+          #  ^^^
+```
+
+And it does, all our tests are green now. We should continue like this, until we understand code enough and we have enough confidence in our tests, so that we can make our desired change to the code. When we thing we are done, we should integrate isolated code back to the legacy code, leaving all the fakes and injection capabilities in place. We were isolating this code only to make sure, that we are not calling any dependencies on accident (and they just work silently). While integrating it back we of course get rid of `fail "NAME:nope"` implementations of collaborators. With such approach, integrating the code back should be as simple as copy-pasting the test suite code and production code (function under the test, and injecting facilities) without copying always-failing collaborators.
